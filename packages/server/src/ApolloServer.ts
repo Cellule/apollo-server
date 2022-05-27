@@ -717,7 +717,6 @@ export class ApolloServer<TContext extends BaseContext = BaseContext> {
           : providedUnprefixedDocumentStore === null
           ? null
           : new PrefixingKeyValueCache(
-              // FIXME: is this still inferred as `any`? why?
               providedUnprefixedDocumentStore,
               `${uuid.v4()}:`,
             ),
