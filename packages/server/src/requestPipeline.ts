@@ -11,6 +11,7 @@ import {
   execute as graphqlExecute,
   Kind,
   ParseOptions,
+  ExecutionResult,
 } from 'graphql';
 import {
   symbolExecutionDispatcherWillResolveField,
@@ -29,9 +30,7 @@ import {
   BadRequestError,
 } from './errors';
 import type {
-  GraphQLResponse,
   GraphQLRequestContext,
-  GraphQLExecutionResult,
   GraphQLRequestListener,
   GraphQLRequestContextDidResolveSource,
   GraphQLRequestContextExecutionDidStart,
@@ -43,13 +42,13 @@ import type {
   GraphQLRequestContextDidEncounterErrors,
   GraphQLRequestExecutionListener,
   BaseContext,
-  HTTPGraphQLResponse,
 } from './externalTypes';
 
 import { Dispatcher } from './utils/dispatcher';
 
-import { HeaderMap } from './runHttpQuery';
+import { HeaderMap, newHTTPGraphQLHead } from './runHttpQuery';
 import type { ApolloServerInternals, SchemaDerivedData } from './ApolloServer';
+import type { HTTPGraphQLHead } from './externalTypes/http';
 
 export const APQ_CACHE_PREFIX = 'apq:';
 
@@ -91,7 +90,7 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
   schemaDerivedData: SchemaDerivedData,
   internals: ApolloServerInternals<TContext>,
   requestContext: Mutable<GraphQLRequestContext<TContext>>,
-): Promise<GraphQLResponse> {
+) {
   const dispatcher = await initializeRequestListenerDispatcher();
 
   const request = requestContext.request;
@@ -283,7 +282,11 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
   } catch (err) {
     // XXX: This cast is pretty sketchy, as other error types can be thrown
     // by didResolveOperation!
-    return await sendErrorResponse(err as GraphQLError);
+    return await sendErrorResponse(
+      err as GraphQLError,
+      undefined,
+      newHTTPGraphQLHead(500),
+    );
   }
 
   // Now that we've gone through the pre-execution phases of the request
@@ -306,12 +309,14 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
     ).catch(internals.logger.warn);
   }
 
-  let response: GraphQLResponse | null =
-    await dispatcher.invokeHooksUntilNonNull(
-      'responseForOperation',
-      requestContext as GraphQLRequestContextResponseForOperation<TContext>,
-    );
-  if (response == null) {
+  const responseFromPlugin = await dispatcher.invokeHooksUntilNonNull(
+    'responseForOperation',
+    requestContext as GraphQLRequestContextResponseForOperation<TContext>,
+  );
+  if (responseFromPlugin !== null) {
+    requestContext.response.result = responseFromPlugin.result;
+    updateResponseHTTP(responseFromPlugin.http);
+  } else {
     const executionListeners: GraphQLRequestExecutionListener<TContext>[] = [];
     (
       await dispatcher.invokeHook(
@@ -399,7 +404,7 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
         await didEncounterErrors(resultErrors);
       }
 
-      response = {
+      requestContext.response.result = {
         ...result,
         errors: resultErrors ? formatErrors(resultErrors) : undefined,
       };
@@ -412,21 +417,16 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
       );
       // XXX: This cast is pretty sketchy, as other error types can be thrown
       // in the try block!
-      return await sendErrorResponse(executionError as GraphQLError);
+      return await sendErrorResponse(
+        executionError as GraphQLError,
+        undefined,
+        newHTTPGraphQLHead(500),
+      );
     }
   }
 
-  if (internals.formatResponse) {
-    const formattedResponse: GraphQLResponse | null = internals.formatResponse(
-      response,
-      requestContext,
-    );
-    if (formattedResponse != null) {
-      response = formattedResponse;
-    }
-  }
-
-  return sendResponse(response);
+  await invokeWillSendResponse();
+  return;
 
   function parse(query: string, parseOptions?: ParseOptions): DocumentNode {
     return graphqlParse(query, parseOptions);
@@ -441,7 +441,7 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
 
   async function execute(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
-  ): Promise<GraphQLExecutionResult> {
+  ): Promise<ExecutionResult> {
     const { request, document } = requestContext;
 
     const executionArgs: ExecutionArgs = {
@@ -467,35 +467,22 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
     }
   }
 
-  async function sendResponse(
-    response: GraphQLResponse,
-  ): Promise<GraphQLResponse> {
-    requestContext.response = {
-      ...requestContext.response,
-      errors: response.errors,
-      data: response.data,
-      extensions: response.extensions,
-    };
-    if (response.http) {
-      if (!requestContext.response.http) {
-        requestContext.response.http = {
-          headers: new HeaderMap(),
-        };
-      }
-      if (response.http.statusCode) {
-        requestContext.response.http.statusCode = response.http.statusCode;
-      }
-      for (const [name, value] of response.http.headers) {
-        // TODO(AS4): this is overwriting rather than appending. However we should
-        // probably be able to eliminate this whole block if we refactor GraphQLResponse.
-        requestContext.response.http.headers.set(name, value);
-      }
+  function updateResponseHTTP(http: HTTPGraphQLHead) {
+    if (http.statusCode) {
+      requestContext.response.http.statusCode = http.statusCode;
     }
+    for (const [name, value] of http.headers) {
+      // TODO(AS4): this is overwriting rather than appending. However we should
+      // probably be able to eliminate this whole block if we refactor GraphQLResponse.
+      requestContext.response.http.headers.set(name, value);
+    }
+  }
+
+  async function invokeWillSendResponse() {
     await dispatcher.invokeHook(
       'willSendResponse',
       requestContext as GraphQLRequestContextWillSendResponse<TContext>,
     );
-    return requestContext.response;
   }
 
   // Note that we ensure that all calls to didEncounterErrors are followed by
@@ -509,10 +496,19 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
     );
   }
 
+  // This function "sends" a response that contains errors and no data (not even
+  // `data: null`) because the pipeline does not make it to a successful
+  // `execute` call. (It is *not* called for execution that happens to return
+  // some errors.) In this case "send" means "update requestContext.response and
+  // invoke willSendResponse hooks".
+  //
+  // If `http` is provided, it sets its status code and headers if given.
+  //
+  // Then, if the HTTP status code is not yet set, it sets it to 400.
   async function sendErrorResponse(
     errorOrErrors: ReadonlyArray<GraphQLError> | GraphQLError,
     errorClass?: typeof ApolloError,
-    http?: Pick<HTTPGraphQLResponse, 'headers' | 'statusCode'>,
+    http: HTTPGraphQLHead = newHTTPGraphQLHead(),
   ) {
     // If a single error is passed, it should still be encapsulated in an array.
     const errors = Array.isArray(errorOrErrors)
@@ -521,7 +517,7 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
 
     await didEncounterErrors(errors);
 
-    const response: GraphQLResponse = {
+    requestContext.response.result = {
       errors: formatErrors(
         errors.map((err) =>
           err instanceof ApolloError && !errorClass
@@ -534,10 +530,16 @@ export async function processGraphQLRequest<TContext extends BaseContext>(
               ),
         ),
       ),
-      http,
     };
 
-    return sendResponse(response);
+    updateResponseHTTP(http);
+
+    if (!requestContext.response.http.statusCode) {
+      // TODO(AS4): This is a bit weird because it can
+      requestContext.response.http.statusCode = 400;
+    }
+
+    await invokeWillSendResponse();
   }
 
   function formatErrors(
